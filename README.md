@@ -58,12 +58,15 @@ Para INSS, o programa procura as linhas da composição da guia, verifica os có
 
 A pasta raiz selecionada deve conter as subpastas abaixo:
 Pasta das guias/
+```text
+Pasta das guias/
 ├── IRRF/
 │   └── arquivos PDF
 ├── CSRF/
 │   └── arquivos PDF
 └── INSS/
     └── arquivos PDF
+```
 
 Os nomes dos PDFs devem seguir o padrão:
 agente - imposto - empresa - periodo.pdf
@@ -105,4 +108,13 @@ Situacao
 Na coluna `Status Final`:
 - `ok` recebe preenchimento verde
 - `revisar` recebe preenchimento vermelho
+
+## Utilização
+
+1. Abra o executável.
+2. Selecione a pasta raiz dos PDFs.
+3. Confirme que a pasta contém as subpastas `IRRF`, `CSRF` e `INSS`.
+4. Selecione o arquivo Excel `Apuracao-retidos.xlsx`, ou informe a pasta onde ele está localizado quando utilizar a versão em Python.
+5. Clique em **Conferir guias**.
+6. Ao final do processamento, abra o arquivo `resultado_conferencia_retidos.xlsx`.
 
