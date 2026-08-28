@@ -1,4 +1,4 @@
-# Conferência de Guias RET
+# Conferência de Guias Retidos
 
 Aplicação para conferir guias de IRRF, CSRF e INSS em PDF contra a planilha `Apuracao-retidos.xlsx`.
 
