@@ -1,6 +1,6 @@
 # Conferência de Guias Retidos
 
-Aplicação com interface gráfica para conferir guias de IRRF, CSRF e INSS em PDF contra a planilha `Apuracao-retidos.xlsx`, utilizando também o CNPJ como critério de cruzamento.
+Aplicação com interface gráfica para conferir guias de IRRF, CSRF e INSS em PDF contra a planilha `Apuracao-retidos.xlsx`.
 
 ## O que o programa faz
 
@@ -13,7 +13,7 @@ Aplicação com interface gráfica para conferir guias de IRRF, CSRF e INSS em P
    - Código de receita
    - Período de apuração
    - Valor da guia
-   - CNPJ (quando identificado no PDF)
+   - CNPJ
 3. Lê a aba `Base Guias` da planilha `Apuracao-retidos.xlsx`.
 4. Cruza os dados usando a chave:
 
