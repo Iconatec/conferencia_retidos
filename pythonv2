@@ -1,0 +1,1095 @@
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import sys
+import threading
+import unicodedata
+from collections import defaultdict
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+from tkinter import filedialog, messagebox
+from typing import Any, Callable
+
+import customtkinter as ctk
+import pandas as pd
+from PIL import Image, ImageOps
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import fitz
+except ImportError:
+    fitz = None
+
+# =============================================================================
+# CONFIGURACOES
+# =============================================================================
+
+CODIGOS_POR_IMPOSTO = {
+    "IRRF": ["1708", "3280", "8045"],
+    "CSRF": ["5952"],
+    "INSS": ["1162"],
+}
+
+IMPOSTOS_VALIDOS = set(CODIGOS_POR_IMPOSTO.keys())
+
+MESES = {
+    "janeiro": "01", "fevereiro": "02", "marco": "03", "abril": "04",
+    "maio": "05", "junho": "06", "julho": "07", "agosto": "08",
+    "setembro": "09", "outubro": "10", "novembro": "11", "dezembro": "12",
+}
+
+MESES_EXIBICAO = {
+    "01": "Janeiro", "02": "Fevereiro", "03": "Marco", "04": "Abril",
+    "05": "Maio", "06": "Junho", "07": "Julho", "08": "Agosto",
+    "09": "Setembro", "10": "Outubro", "11": "Novembro", "12": "Dezembro",
+}
+
+COLUNAS_RESULTADO = ["Valor PDF", "Diferenca", "Codigo PDF", "Status Final", "Situacao"]
+
+# =============================================================================
+# ESTRUTURAS DE DADOS
+# =============================================================================
+
+@dataclass
+class GuiaPDF:
+    arquivo_pdf: str
+    caminho_pdf: Path
+    imposto: str
+    agente: str
+    empresa: str
+    periodo: str
+    valor_pdf: Decimal | None
+    codigo_pdf: str
+    cnpj: str = ""
+    codigos_inss: list[str] = field(default_factory=list)
+    valores_inss: list[Decimal] = field(default_factory=list)
+    observacoes: list[str] = field(default_factory=list)
+
+# =============================================================================
+# UTILITARIOS
+# =============================================================================
+
+def texto(valor: Any) -> str:
+    if valor is None:
+        return ""
+    try:
+        if pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return re.sub(r"\s+", " ", str(valor).replace("\u00A0", " ")).strip()
+
+def sem_acentos(valor: Any) -> str:
+    return "".join(
+        caractere
+        for caractere in unicodedata.normalize("NFD", texto(valor))
+        if unicodedata.category(caractere) != "Mn"
+    ).lower()
+
+def texto_chave(valor: Any) -> str:
+    valor_normalizado = sem_acentos(valor).upper()
+    valor_normalizado = valor_normalizado.replace("&", "E")
+    return re.sub(r"[^A-Z0-9]", "", valor_normalizado)
+
+def normalizar_cnpj(valor: Any) -> str:
+    if valor is None:
+        return ""
+    try:
+        if pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(valor, float) and not isinstance(valor, bool):
+        if valor.is_integer():
+            return str(int(valor)).zfill(14)
+        return f"{valor:.0f}".zfill(14)
+    if isinstance(valor, int) and not isinstance(valor, bool):
+        return str(valor).zfill(14)
+    valor_texto = texto(valor)
+    if "e" in valor_texto.lower():
+        try:
+            valor_float = float(valor_texto)
+            if valor_float.is_integer():
+                return f"{int(valor_float):014d}"
+        except ValueError:
+            pass
+    if re.fullmatch(r"\d+\.0+", valor_texto):
+        return valor_texto.split(".")[0].zfill(14)
+    digitos = re.sub(r"\D", "", valor_texto)
+    if len(digitos) <= 14:
+        return digitos.zfill(14)
+    return digitos[:14]
+
+def formatar_cnpj(valor: Any) -> str:
+    cnpj = normalizar_cnpj(valor)
+    if len(cnpj) != 14:
+        return texto(valor)
+    return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+
+def numero(valor: Any) -> Decimal | None:
+    if valor is None:
+        return None
+    try:
+        if pd.isna(valor):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(valor, Decimal):
+        return valor.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if isinstance(valor, int) and not isinstance(valor, bool):
+        return Decimal(valor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if isinstance(valor, float) and not isinstance(valor, bool):
+        return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    valor_texto = texto(valor).replace("R$", "").replace(" ", "")
+    if not valor_texto:
+        return None
+    valor_texto = re.sub(r"[^\d,.\-]", "", valor_texto)
+    if "," in valor_texto:
+        valor_texto = valor_texto.replace(".", "").replace(",", ".")
+    try:
+        return Decimal(valor_texto).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+
+def valor_para_excel(valor: Decimal | None) -> float | None:
+    return float(valor) if valor is not None else None
+
+def normalizar_imposto(valor: Any) -> str:
+    imposto = sem_acentos(valor).upper()
+    aliases = {
+        "IRRF": "IRRF",
+        "IMPOSTO DE RENDA RETIDO": "IRRF",
+        "IMPOSTO DE RENDA RETIDO NA FONTE": "IRRF",
+        "CSRF": "CSRF",
+        "PCC": "CSRF",
+        "PIS COFINS CSLL": "CSRF",
+        "PIS/COFINS/CSLL": "CSRF",
+        "PIS COFINS": "CSRF",
+        "INSS": "INSS",
+    }
+    return aliases.get(imposto, imposto)
+
+def normalizar_codigo(valor: Any) -> str:
+    encontrado = re.search(r"\b(\d{4})\b", texto(valor))
+    return encontrado.group(1) if encontrado else ""
+
+def normalizar_periodo(valor: Any) -> str:
+    valor_normalizado = re.sub(r"\s+", "", sem_acentos(valor))
+    encontrado = re.search(
+        r"\b("
+        r"janeiro|fevereiro|marco|abril|maio|junho|"
+        r"julho|agosto|setembro|outubro|novembro|dezembro"
+        r")[/-](\d{4})\b",
+        valor_normalizado,
+    )
+    if encontrado:
+        mes, ano = encontrado.groups()
+        return f"{ano}-{MESES[mes]}"
+    encontrado = re.search(r"\b(\d{4})[/-]("
+        r"janeiro|fevereiro|marco|abril|maio|junho|"
+        r"julho|agosto|setembro|outubro|novembro|dezembro"
+        r")\b", valor_normalizado)
+    if encontrado:
+        ano, mes = encontrado.groups()
+        return f"{ano}-{MESES[mes]}"
+    encontrado = re.search(r"\b(\d{1,2})[/-](\d{4})\b", valor_normalizado)
+    if encontrado:
+        mes, ano = encontrado.groups()
+        return f"{ano}-{mes.zfill(2)}"
+    encontrado = re.search(r"\b(\d{4})[/-](\d{1,2})\b", valor_normalizado)
+    if encontrado:
+        ano, mes = encontrado.groups()
+        return f"{ano}-{mes.zfill(2)}"
+    return ""
+
+def periodo_exibicao(periodo: str) -> str:
+    encontrado = re.fullmatch(r"(\d{4})-(\d{2})", texto(periodo))
+    if not encontrado:
+        return texto(periodo)
+    ano, mes = encontrado.groups()
+    return f"{MESES_EXIBICAO.get(mes, mes)}/{ano}"
+
+def construir_chave(
+    agente: str,
+    imposto: str,
+    empresa: str,
+    periodo: str,
+    valor: Decimal | None,
+    cnpj: str | None = None,
+) -> tuple[str, str, str, str, Decimal, str] | None:
+    if not agente or not imposto or not empresa or not periodo or valor is None:
+        return None
+    cnpj_norm = normalizar_cnpj(cnpj or "")
+    return (
+        texto_chave(agente),
+        normalizar_imposto(imposto),
+        texto_chave(empresa),
+        normalizar_periodo(periodo),
+        valor.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        cnpj_norm,
+    )
+
+def construir_chave_sem_valor(
+    agente: str,
+    imposto: str,
+    empresa: str,
+    periodo: str,
+    cnpj: str | None = None,
+) -> tuple[str, str, str, str, str] | None:
+    if not agente or not imposto or not empresa or not periodo:
+        return None
+    cnpj_norm = normalizar_cnpj(cnpj or "")
+    return (
+        texto_chave(agente),
+        normalizar_imposto(imposto),
+        texto_chave(empresa),
+        normalizar_periodo(periodo),
+        cnpj_norm,
+    )
+
+# =============================================================================
+# PARSE DO NOME DO ARQUIVO
+# =============================================================================
+
+def extrair_imposto_e_codigo_do_nome(nome_imposto: str) -> tuple[str, str]:
+    nome = texto(nome_imposto)
+    codigo = ""
+    m = re.search(r"\b(\d{4})\b", nome)
+    if m:
+        codigo = m.group(1)
+        nome = nome.replace(codigo, "").strip()
+    imposto = normalizar_imposto(nome)
+    return imposto, codigo
+
+def extrair_periodo_do_nome(partes: list[str]) -> str:
+    padrao_periodo = re.compile(r"^\d{1,2}[./-]\d{4}$")
+    for i in range(len(partes) - 1, max(len(partes) - 4, -1), -1):
+        if padrao_periodo.match(partes[i]):
+            return partes[i]
+    return ""
+
+def parse_nome_arquivo(nome_arquivo: str) -> dict[str, str]:
+    nome = Path(nome_arquivo).stem
+    partes = [parte.strip() for parte in nome.split("-")]
+    if len(partes) < 4:
+        return {"agente": "", "imposto": "", "empresa": "", "periodo": ""}
+    agente = texto_chave(partes[0])
+    imposto_bruto = partes[1]
+    imposto, _ = extrair_imposto_e_codigo_do_nome(imposto_bruto)
+    periodo_nome = extrair_periodo_do_nome(partes)
+    if periodo_nome:
+        periodo_idx = partes.index(periodo_nome)
+        empresa_partes = partes[2:periodo_idx]
+    else:
+        empresa_partes = partes[2:-1]
+    empresa = "-".join(empresa_partes) if empresa_partes else ""
+    periodo = periodo_nome if periodo_nome else partes[-1]
+    return {"agente": agente, "imposto": imposto, "empresa": empresa, "periodo": periodo}
+
+# =============================================================================
+# LOCALIZACAO E LEITURA DOS PDFs
+# =============================================================================
+
+def localizar_pdfs(pasta_raiz: Path) -> list[Path]:
+    pdfs: list[Path] = []
+    for imposto in sorted(IMPOSTOS_VALIDOS):
+        pasta_imposto = pasta_raiz / imposto
+        if not pasta_imposto.exists():
+            print(f"Aviso: subpasta nao encontrada e sera ignorada: {pasta_imposto}")
+            continue
+        if not pasta_imposto.is_dir():
+            print(f"Aviso: o caminho nao e uma pasta e sera ignorada: {pasta_imposto}")
+            continue
+        pdfs.extend(
+            arquivo
+            for arquivo in pasta_imposto.rglob("*")
+            if arquivo.is_file() and arquivo.suffix.lower() == ".pdf"
+        )
+    return sorted(pdfs)
+
+def obter_imposto_da_subpasta(caminho_pdf: Path, pasta_raiz: Path) -> str:
+    try:
+        partes_relativas = caminho_pdf.resolve().relative_to(pasta_raiz.resolve()).parts
+    except ValueError:
+        partes_relativas = caminho_pdf.parts
+    for parte in partes_relativas[:-1]:
+        imposto = normalizar_imposto(parte)
+        if imposto in IMPOSTOS_VALIDOS:
+            return imposto
+    return ""
+
+def extrair_texto_pdf(caminho_pdf: Path) -> str:
+    if pdfplumber is not None:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            return "\n".join(pagina.extract_text() or "" for pagina in pdf.pages)
+    if fitz is not None:
+        documento = fitz.open(caminho_pdf)
+        try:
+            return "\n".join(pagina.get_text() for pagina in documento)
+        finally:
+            documento.close()
+    raise RuntimeError("Nenhuma biblioteca de PDF disponivel. Instale pdfplumber ou pymupdf.")
+
+def capturar(texto_pdf: str, padrao: str, grupo: int = 1) -> str:
+    encontrado = re.search(padrao, texto_pdf, flags=re.IGNORECASE | re.DOTALL)
+    return texto(encontrado.group(grupo)) if encontrado else ""
+
+def extrair_periodo(texto_pdf: str) -> str:
+    encontrado = re.search(
+        r"\b(janeiro|fevereiro|mar[çc]o|abril|maio|junho|julho|agosto|"
+        r"setembro|outubro|novembro|dezembro)\s*/\s*(\d{4})\b",
+        texto_pdf,
+        flags=re.IGNORECASE,
+    )
+    if not encontrado:
+        return ""
+    return f"{encontrado.group(2)}-{MESES[sem_acentos(encontrado.group(1))]}"
+
+def extrair_cnpj(texto_pdf: str) -> str:
+    """Extrai o primeiro CNPJ no formato XX.XXX.XXX/XXXX-XX."""
+    padrao = r"\b(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b"
+    encontrado = re.search(padrao, texto_pdf)
+    return texto(encontrado.group(1)) if encontrado else ""
+
+def extrair_codigo_principal(texto_pdf: str) -> str:
+    padroes = [
+        r"Composi[çc][ãa]o\s+do\s+Documento\s+de\s+Arrecada[çc][ãa]o[\s\S]{0,250}?\b(\d{4})\b",
+        r"C[óo]digo\s+Principal[\s:.-]*(\d{4})\b",
+    ]
+    for padrao in padroes:
+        codigo = normalizar_codigo(capturar(texto_pdf, padrao))
+        if codigo:
+            return codigo
+    encontrados = re.findall(r"\b(1708|3280|5952|1162|8045)\b", texto_pdf)
+    return encontrados[0] if encontrados else ""
+
+def extrair_valor_guia_nao_inss(texto_pdf: str) -> Decimal | None:
+    padroes = [
+        r"C[óo]digo\s+Principal[\s\S]{0,220}?(\d{1,3}(?:\.\d{3})*,\d{2})",
+        r"Valor\s+Total\s+do\s+Documento[\s\S]{0,150}?(\d{1,3}(?:\.\d{3})*,\d{2})",
+    ]
+    for padrao in padroes:
+        valor = numero(capturar(texto_pdf, padrao))
+        if valor is not None:
+            return valor
+    return None
+
+def _extrair_linhas_de_bloco(bloco: str) -> tuple[list[str], list[Decimal]]:
+    codigos: list[str] = []
+    valores: list[Decimal] = []
+    for linha in [linha.strip() for linha in bloco.splitlines() if linha.strip()]:
+        codigo_encontrado = re.search(r"\b(\d{4})\b", linha)
+        if not codigo_encontrado:
+            continue
+        codigo = codigo_encontrado.group(1)
+        if codigo in {"2026", "2025", "2024", "2023", "2022"}:
+            continue
+        valores_texto = re.findall(r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b", linha)
+        if not valores_texto:
+            continue
+        valor = numero(valores_texto[0])
+        if valor is not None:
+            codigos.append(codigo)
+            valores.append(valor)
+    return codigos, valores
+
+def _extrair_linhas_inss_fallback(texto_pdf: str) -> tuple[list[str], list[Decimal]]:
+    codigos: list[str] = []
+    valores: list[Decimal] = []
+    padrao = re.compile(r"\b1162\b[\s\S]{0,150}?(\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
+    for match in padrao.finditer(texto_pdf):
+        valor = numero(match.group(1))
+        if valor is not None:
+            codigos.append("1162")
+            valores.append(valor)
+    return codigos, valores
+
+def extrair_linhas_inss(texto_pdf: str) -> tuple[list[str], list[Decimal]]:
+    codigos: list[str] = []
+    valores: list[Decimal] = []
+    padrao_inicio = re.compile(r"Composi[çc][ãa]o\s+do\s+Documento\s+de\s+Arrecada[çc][ãa]o", re.IGNORECASE)
+    padroes_fim = re.compile(r"(?:Total\s+(?:a\s+)?Pagar|Valor\s+Total\s+do\s+Documento|Autentica[çc][ãa]o|Observa[çc][õo]es|Codigo\s+de\s+Autentica[çc][ãa]o)", re.IGNORECASE)
+    indices_inicio = [match.start() for match in padrao_inicio.finditer(texto_pdf)]
+    if not indices_inicio:
+        return _extrair_linhas_inss_fallback(texto_pdf)
+    for indice_inicio in indices_inicio:
+        bloco = texto_pdf[indice_inicio:]
+        match_fim = padroes_fim.search(bloco)
+        if match_fim:
+            bloco = bloco[:match_fim.start()]
+        codigos_bloco, valores_bloco = _extrair_linhas_de_bloco(bloco)
+        codigos.extend(codigos_bloco)
+        valores.extend(valores_bloco)
+    if len(codigos) > 1:
+        codigos_unicos = [codigos[0]]
+        valores_unicos = [valores[0]]
+        for indice in range(1, len(codigos)):
+            if codigos[indice] != codigos[indice - 1] or valores[indice] != valores[indice - 1]:
+                codigos_unicos.append(codigos[indice])
+                valores_unicos.append(valores[indice])
+        return codigos_unicos, valores_unicos
+    return codigos, valores
+
+def extrair_valor_total_inss(texto_pdf: str) -> Decimal | None:
+    padroes = [
+        r"Valor\s+Total\s+do\s+Documento[\s\S]{0,150}?(\d{1,3}(?:\.\d{3})*,\d{2})",
+        r"Total\s+a\s+Pagar[\s\S]{0,150}?(\d{1,3}(?:\.\d{3})*,\d{2})",
+        r"Total\s+do\s+Documento[\s\S]{0,150}?(\d{1,3}(?:\.\d{3})*,\d{2})",
+    ]
+    for padrao in padroes:
+        valor = numero(capturar(texto_pdf, padrao))
+        if valor is not None:
+            return valor
+    return None
+
+def extrair_pdf(caminho_pdf: Path, pasta_raiz: Path) -> GuiaPDF:
+    imposto_subpasta = obter_imposto_da_subpasta(caminho_pdf, pasta_raiz)
+    texto_pdf = extrair_texto_pdf(caminho_pdf)
+    dados_nome = parse_nome_arquivo(caminho_pdf.name)
+    guia = GuiaPDF(
+        arquivo_pdf=caminho_pdf.name,
+        caminho_pdf=caminho_pdf,
+        imposto=imposto_subpasta or dados_nome["imposto"],
+        agente=dados_nome["agente"],
+        empresa=dados_nome["empresa"],
+        periodo=normalizar_periodo(dados_nome["periodo"]) or extrair_periodo(texto_pdf),
+        valor_pdf=None,
+        codigo_pdf="",
+        cnpj=extrair_cnpj(texto_pdf),
+    )
+    if not guia.imposto:
+        guia.observacoes.append("Imposto nao identificado.")
+        return guia
+    codigo_esperado = CODIGOS_POR_IMPOSTO[guia.imposto]
+    if guia.imposto == "INSS":
+        codigos, valores = extrair_linhas_inss(texto_pdf)
+        guia.codigos_inss = codigos
+        guia.valores_inss = valores
+        guia.codigo_pdf = ", ".join(sorted(set(codigos))) if codigos else ""
+        if valores:
+            guia.valor_pdf = sum(valores, Decimal("0.00"))
+        else:
+            guia.valor_pdf = extrair_valor_total_inss(texto_pdf)
+            guia.observacoes.append("Nao foi possivel extrair as linhas do INSS; foi utilizado o valor total da guia como tentativa alternativa.")
+        if not codigos:
+            guia.observacoes.append("Nenhuma linha de codigo/valor foi identificada na composicao do INSS.")
+        elif any(codigo not in codigo_esperado for codigo in codigos):
+            guia.observacoes.append("Guia INSS possui codigo(s) diferente(s) de 1162: " + ", ".join(sorted(set(codigos))))
+        return guia
+    guia.codigo_pdf = extrair_codigo_principal(texto_pdf)
+    guia.valor_pdf = extrair_valor_guia_nao_inss(texto_pdf)
+    if not guia.codigo_pdf:
+        guia.observacoes.append("Codigo principal nao identificado no PDF.")
+    elif guia.codigo_pdf not in codigo_esperado:
+        guia.observacoes.append(f"Codigo encontrado ({guia.codigo_pdf}) incompativel com o imposto {guia.imposto} (esperado: {', '.join(codigo_esperado)}).")
+    if guia.valor_pdf is None:
+        guia.observacoes.append("Valor da guia nao identificado no PDF.")
+    return guia
+
+# =============================================================================
+# LEITURA DA PLANILHA
+# =============================================================================
+
+def localizar_coluna(colunas: list[str], candidatos: list[str]) -> str | None:
+    mapa = {sem_acentos(coluna): coluna for coluna in colunas}
+    for candidato in candidatos:
+        candidato_normalizado = sem_acentos(candidato)
+        if candidato_normalizado in mapa:
+            return mapa[candidato_normalizado]
+    for coluna in colunas:
+        coluna_normalizada = sem_acentos(coluna)
+        if any(sem_acentos(candidato) in coluna_normalizada for candidato in candidatos):
+            return coluna
+    return None
+
+def carregar_planilha(caminho_excel: Path) -> tuple[pd.DataFrame, dict[str, str]]:
+    dataframe = pd.read_excel(caminho_excel, sheet_name="Base Guias", dtype=object)
+    dataframe.columns = [texto(coluna) for coluna in dataframe.columns]
+    colunas = list(dataframe.columns)
+    campos = {
+        "agente": localizar_coluna(colunas, ["Agente"]),
+        "cnpj": localizar_coluna(colunas, ["CNPJ"]),
+        "valor": localizar_coluna(colunas, ["Valor Guia"]),
+        "imposto": localizar_coluna(colunas, ["Imposto"]),
+        "periodo": localizar_coluna(colunas, ["Periodo", "Período"]),
+        "empresa": localizar_coluna(colunas, ["Empresa"]),
+    }
+    faltantes = [campo for campo, coluna in campos.items() if coluna is None]
+    if faltantes:
+        raise ValueError("Colunas nao encontradas na aba 'Base Guias': " + ", ".join(faltantes))
+    return dataframe, campos  # type: ignore[return-value]
+
+# =============================================================================
+# VALIDACOES DAS GUIAS
+# =============================================================================
+
+def motivo_codigo_invalido(guia: GuiaPDF) -> str:
+    if guia.imposto not in CODIGOS_POR_IMPOSTO:
+        return "Imposto nao identificado"
+    codigos_esperados = CODIGOS_POR_IMPOSTO[guia.imposto]
+    if guia.imposto == "INSS":
+        if not guia.codigos_inss:
+            return "Codigo(s) das linhas do INSS nao identificado(s)"
+        codigos_diferentes = sorted(set(codigo for codigo in guia.codigos_inss if codigo not in codigos_esperados))
+        if codigos_diferentes:
+            return "INSS com codigos mistos: " + ", ".join(sorted(set(guia.codigos_inss)))
+        return ""
+    if not guia.codigo_pdf:
+        return "Codigo da guia nao identificado"
+    if guia.codigo_pdf not in codigos_esperados:
+        return f"Codigo incompativel: encontrado {guia.codigo_pdf}, esperado {', '.join(codigos_esperados)} para {guia.imposto}"
+    return ""
+
+def guia_tem_dados_minimos(guia: GuiaPDF) -> bool:
+    return bool(guia.agente and guia.imposto and guia.empresa and guia.periodo and guia.valor_pdf is not None)
+
+def codigo_eh_valido(guia: GuiaPDF) -> bool:
+    if guia.imposto not in CODIGOS_POR_IMPOSTO:
+        return False
+    codigos_esperados = CODIGOS_POR_IMPOSTO[guia.imposto]
+    if guia.imposto == "INSS":
+        return all(codigo in codigos_esperados for codigo in guia.codigos_inss)
+    return guia.codigo_pdf in codigos_esperados
+
+# =============================================================================
+# CRUZAMENTO PLANILHA X PDF
+# =============================================================================
+
+def comparar(dataframe: pd.DataFrame, campos: dict[str, str], guias_pdf: list[GuiaPDF]) -> pd.DataFrame:
+    colunas_saida = ["Agente", "CNPJ", "Valor Guia", "Imposto", "Periodo", "Empresa"] + COLUNAS_RESULTADO
+    registros: list[dict[str, Any]] = []
+
+    pdfs_por_chave_completa: dict[tuple[str, str, str, str, Decimal, str], list[int]] = defaultdict(list)
+    pdfs_por_chave_sem_valor: dict[tuple[str, str, str, str, str], list[int]] = defaultdict(list)
+
+    for indice_pdf, guia in enumerate(guias_pdf):
+        chave_completa = construir_chave(
+            guia.agente,
+            guia.imposto,
+            guia.empresa,
+            guia.periodo,
+            guia.valor_pdf,
+            guia.cnpj,
+        )
+        if chave_completa is not None:
+            pdfs_por_chave_completa[chave_completa].append(indice_pdf)
+
+        chave_sem_valor = construir_chave_sem_valor(
+            guia.agente,
+            guia.imposto,
+            guia.empresa,
+            guia.periodo,
+            guia.cnpj,
+        )
+        if chave_sem_valor is not None:
+            pdfs_por_chave_sem_valor[chave_sem_valor].append(indice_pdf)
+
+    usados: set[int] = set()
+
+    for _, linha in dataframe.iterrows():
+        registro: dict[str, Any] = {}
+        agente_original = texto(linha[campos["agente"]])
+        empresa_original = texto(linha[campos["empresa"]])
+        agente = texto_chave(agente_original)
+        cnpj = normalizar_cnpj(linha[campos["cnpj"]])
+        valor_guia = numero(linha[campos["valor"]])
+        imposto = normalizar_imposto(linha[campos["imposto"]])
+        periodo = normalizar_periodo(linha[campos["periodo"]])
+        empresa = texto_chave(empresa_original)
+
+        registro["Agente"] = agente_original
+        registro["CNPJ"] = formatar_cnpj(cnpj)
+        registro["Valor Guia"] = valor_para_excel(valor_guia)
+        registro["Imposto"] = imposto
+        registro["Periodo"] = periodo_exibicao(periodo)
+        registro["Empresa"] = empresa_original
+        registro["Valor PDF"] = None
+        registro["Diferenca"] = None
+        registro["Codigo PDF"] = None
+        registro["Status Final"] = "revisar"
+        registro["Situacao"] = ""
+
+        if not agente:
+            registro["Situacao"] = "Agente ausente na planilha; sem cruzamento possivel"
+            registros.append(registro)
+            continue
+
+        if imposto not in IMPOSTOS_VALIDOS:
+            registro["Situacao"] = f"Imposto invalido ou nao reconhecido: {imposto or '(vazio)'}"
+            registros.append(registro)
+            continue
+
+        if not empresa:
+            registro["Situacao"] = "Empresa ausente na planilha"
+            registros.append(registro)
+            continue
+
+        if not periodo:
+            registro["Situacao"] = "Periodo ausente ou invalido na planilha"
+            registros.append(registro)
+            continue
+
+        if valor_guia is None:
+            registro["Situacao"] = "Valor Guia ausente ou invalido na planilha"
+            registros.append(registro)
+            continue
+
+        chave_planilha = construir_chave(
+            agente,
+            imposto,
+            empresa_original,
+            periodo,
+            valor_guia,
+            cnpj,
+        )
+
+        if chave_planilha is not None:
+            correspondentes = [
+                indice
+                for indice in pdfs_por_chave_completa.get(chave_planilha, [])
+                if indice not in usados
+            ]
+            if len(correspondentes) == 1:
+                indice_pdf = correspondentes[0]
+                guia = guias_pdf[indice_pdf]
+                registro["Valor PDF"] = valor_para_excel(guia.valor_pdf)
+                registro["Diferenca"] = (
+                    valor_para_excel(guia.valor_pdf - valor_guia)
+                    if guia.valor_pdf is not None
+                    else None
+                )
+                registro["Codigo PDF"] = guia.codigo_pdf
+                erro_codigo = motivo_codigo_invalido(guia)
+                if erro_codigo:
+                    registro["Situacao"] = erro_codigo
+                else:
+                    registro["Status Final"] = "ok"
+                    registro["Situacao"] = "Informacoes corretas"
+                usados.add(indice_pdf)
+                registros.append(registro)
+                continue
+
+        chave_sem_valor = construir_chave_sem_valor(
+            agente,
+            imposto,
+            empresa_original,
+            periodo,
+            cnpj,
+        )
+
+        if chave_sem_valor is not None:
+            candidatos_nao_usados = [
+                indice
+                for indice in pdfs_por_chave_sem_valor.get(chave_sem_valor, [])
+                if indice not in usados
+            ]
+            if len(candidatos_nao_usados) > 1:
+                soma_valores = Decimal("0.00")
+                codigos_encontrados: list[str] = []
+                todos_codigos_validos = True
+                for indice_pdf in candidatos_nao_usados:
+                    guia = guias_pdf[indice_pdf]
+                    if guia.valor_pdf is not None:
+                        soma_valores += guia.valor_pdf
+                    if guia.codigo_pdf:
+                        codigos_encontrados.append(guia.codigo_pdf)
+                    if not codigo_eh_valido(guia):
+                        todos_codigos_validos = False
+
+                diferenca = soma_valores - valor_guia
+                registro["Valor PDF"] = valor_para_excel(soma_valores)
+                registro["Diferenca"] = valor_para_excel(diferenca)
+                registro["Codigo PDF"] = ", ".join(sorted(set(codigos_encontrados)))
+                if diferenca == Decimal("0.00") and todos_codigos_validos:
+                    registro["Status Final"] = "ok"
+                    registro["Situacao"] = "Informacoes corretas (multiplas guias)"
+                elif diferenca == Decimal("0.00"):
+                    registro["Situacao"] = "Soma correta, mas ha codigo incompativel"
+                else:
+                    registro["Situacao"] = (
+                        f"Valor divergente (soma dos PDFs: {soma_valores:.2f}, planilha: {valor_guia:.2f})"
+                    )
+                usados.update(candidatos_nao_usados)
+                registros.append(registro)
+                continue
+
+            if len(candidatos_nao_usados) == 1:
+                indice_pdf = candidatos_nao_usados[0]
+                guia = guias_pdf[indice_pdf]
+                registro["Valor PDF"] = valor_para_excel(guia.valor_pdf)
+                registro["Diferenca"] = (
+                    valor_para_excel(guia.valor_pdf - valor_guia)
+                    if guia.valor_pdf is not None
+                    else None
+                )
+                registro["Codigo PDF"] = guia.codigo_pdf
+                erro_codigo = motivo_codigo_invalido(guia)
+                registro["Situacao"] = (
+                    f"{erro_codigo}; valor tambem diverge"
+                    if erro_codigo
+                    else "Valor da guia divergente"
+                )
+                usados.add(indice_pdf)
+                registros.append(registro)
+                continue
+
+        registro["Situacao"] = "Apenas planilha (PDF nao encontrado)"
+        registros.append(registro)
+
+    for indice_pdf, guia in enumerate(guias_pdf):
+        if indice_pdf in usados:
+            continue
+        registro = {coluna: None for coluna in colunas_saida}
+        registro["Agente"] = guia.agente
+        registro["CNPJ"] = formatar_cnpj(guia.cnpj) if guia.cnpj else None
+        registro["Valor Guia"] = None
+        registro["Imposto"] = guia.imposto
+        registro["Periodo"] = periodo_exibicao(guia.periodo)
+        registro["Empresa"] = guia.empresa
+        registro["Valor PDF"] = valor_para_excel(guia.valor_pdf)
+        registro["Diferenca"] = None
+        registro["Codigo PDF"] = guia.codigo_pdf
+        registro["Status Final"] = "revisar"
+        erro_codigo = motivo_codigo_invalido(guia)
+        if erro_codigo:
+            registro["Situacao"] = f"Apenas PDF; {erro_codigo}"
+        elif not guia_tem_dados_minimos(guia):
+            registro["Situacao"] = "Apenas PDF; dados insuficientes para cruzamento"
+        else:
+            registro["Situacao"] = "Apenas PDF (nao encontrado na planilha)"
+        registros.append(registro)
+
+    return pd.DataFrame(registros, columns=colunas_saida)
+
+# =============================================================================
+# GERACAO DO ARQUIVO EXCEL
+# =============================================================================
+
+def salvar_resultado(resultado: pd.DataFrame, caminho_excel_original: Path) -> Path:
+    caminho_saida = caminho_excel_original.parent / "resultado_conferencia_retidos.xlsx"
+    with pd.ExcelWriter(caminho_saida, engine="openpyxl") as writer:
+        resultado.to_excel(writer, index=False, sheet_name="Base Guias")
+        planilha = writer.book["Base Guias"]
+        planilha.freeze_panes = "A2"
+        planilha.auto_filter.ref = planilha.dimensions
+        cabecalho = {texto(celula.value): celula.column for celula in planilha[1]}
+        for nome_coluna in ["Valor Guia", "Valor PDF", "Diferenca"]:
+            indice_coluna = cabecalho.get(nome_coluna)
+            if indice_coluna:
+                for linha in range(2, planilha.max_row + 1):
+                    planilha.cell(linha, indice_coluna).number_format = "#,##0.00"
+        coluna_status = cabecalho.get("Status Final")
+        if coluna_status:
+            from openpyxl.styles import PatternFill
+            preenchimento_ok = PatternFill(fill_type="solid", fgColor="C6EFCE")
+            preenchimento_revisar = PatternFill(fill_type="solid", fgColor="FFC7CE")
+            for linha in range(2, planilha.max_row + 1):
+                celula = planilha.cell(linha, coluna_status)
+                if texto(celula.value).lower() == "ok":
+                    celula.fill = preenchimento_ok
+                elif texto(celula.value).lower() == "revisar":
+                    celula.fill = preenchimento_revisar
+        for coluna in planilha.columns:
+            maior_tamanho = max(
+                len("" if celula.value is None else str(celula.value))
+                for celula in coluna
+            )
+            planilha.column_dimensions[coluna[0].column_letter].width = min(maior_tamanho + 2, 65)
+    return caminho_saida
+
+# =============================================================================
+# ORQUESTRACAO COM PROGRESSO
+# =============================================================================
+
+def executar_com_progresso(
+    pasta_raiz: Path,
+    caminho_excel: Path,
+    callback_progresso: Callable[[int, int, str], None] | None = None,
+) -> tuple[Path, int]:
+    pdfs = localizar_pdfs(pasta_raiz)
+    if not pdfs:
+        raise FileNotFoundError("Nenhum PDF encontrado nas subpastas IRRF, CSRF e INSS.")
+    total = len(pdfs)
+    guias_pdf: list[GuiaPDF] = []
+    for indice, caminho_pdf in enumerate(pdfs, start=1):
+        if callback_progresso:
+            callback_progresso(indice - 1, total, caminho_pdf.name)
+        try:
+            guias_pdf.append(extrair_pdf(caminho_pdf, pasta_raiz))
+        except Exception as erro:
+            imposto = obter_imposto_da_subpasta(caminho_pdf, pasta_raiz)
+            guias_pdf.append(
+                GuiaPDF(
+                    arquivo_pdf=caminho_pdf.name,
+                    caminho_pdf=caminho_pdf,
+                    imposto=imposto,
+                    agente="",
+                    empresa="",
+                    periodo="",
+                    valor_pdf=None,
+                    codigo_pdf="",
+                    observacoes=[f"Erro ao extrair o PDF: {erro}"],
+                )
+            )
+        if callback_progresso:
+            callback_progresso(indice, total, caminho_pdf.name)
+    dataframe, campos = carregar_planilha(caminho_excel)
+    resultado = comparar(dataframe, campos, guias_pdf)
+    return salvar_resultado(resultado, caminho_excel), total
+
+def resolver_caminho_excel(caminho_informado: Path) -> Path:
+    if caminho_informado.is_file():
+        return caminho_informado
+    if caminho_informado.is_dir():
+        candidatos = sorted(
+            arquivo
+            for arquivo in caminho_informado.iterdir()
+            if arquivo.is_file()
+            and arquivo.suffix.lower() in {".xlsx", ".xls"}
+            and sem_acentos(arquivo.stem).startswith("apuracao-retidos")
+        )
+        if candidatos:
+            return candidatos[0]
+        raise FileNotFoundError(
+            "Nenhum arquivo Excel iniciado por 'Apuracao-retidos' foi encontrado na pasta: "
+            f"{caminho_informado}"
+        )
+    raise FileNotFoundError(f"Caminho nao encontrado: {caminho_informado}")
+
+# =============================================================================
+# INTERFACE GRAFICA
+# =============================================================================
+
+def caminho_recurso(nome_arquivo: str) -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / nome_arquivo
+    return Path(__file__).resolve().parent / nome_arquivo
+
+def aplicar_icone_janela(janela: ctk.CTk) -> None:
+    caminho_ico = caminho_recurso("icone.ico")
+    if caminho_ico.exists():
+        try:
+            janela.iconbitmap(default=str(caminho_ico))
+        except Exception:
+            pass
+
+class ConferenciaApp:
+    AZUL = "#123B66"
+    AZUL_HOVER = "#0D2D4D"
+    VERDE = "#16A36A"
+    VERMELHO = "#D64545"
+    FUNDO_CLARO = "#F6F8FB"
+    FUNDO_ESCURO = "#141A22"
+    CARD_ESCURO = "#1F2937"
+
+    def __init__(self, raiz: ctk.CTk):
+        self.raiz = raiz
+        self.pasta_raiz = ctk.StringVar()
+        self.caminho_excel = ctk.StringVar()
+        self.arquivo_saida: Path | None = None
+        self.modo_escuro = True
+        self.logo_imagem = self.carregar_logo()
+        self.raiz.title("ÍCONA | Conferência de Guias - Retidos")
+        aplicar_icone_janela(self.raiz)
+        self.raiz.geometry("690x520")
+        self.raiz.minsize(650, 520)
+        self.raiz.resizable(True, True)
+        self.criar_interface()
+
+    def carregar_logo(self) -> ctk.CTkImage | None:
+        nomes = ["logo_icona.png", "LOGO_ICONA_PB_INVERSA.png", "LOGO_ICONA_PB_INVERSA.jpg", "LOGO_ICONA_PB_INVERSA-2.jpg"]
+        for nome in nomes:
+            caminho = caminho_recurso(nome)
+            if not caminho.exists():
+                continue
+            try:
+                imagem_original = Image.open(caminho).convert("RGBA")
+                imagem_ajustada = ImageOps.contain(imagem_original, (115, 62), method=Image.Resampling.LANCZOS)
+                return ctk.CTkImage(light_image=imagem_ajustada, dark_image=imagem_ajustada, size=imagem_ajustada.size)
+            except Exception:
+                continue
+        return None
+
+    def criar_interface(self) -> None:
+        self.quadro = ctk.CTkFrame(self.raiz, corner_radius=0, fg_color=(self.FUNDO_CLARO, self.FUNDO_ESCURO))
+        self.quadro.pack(fill="both", expand=True)
+        self.quadro.grid_columnconfigure(0, weight=1)
+        self.quadro.grid_rowconfigure(1, weight=1)
+        self.quadro.grid_rowconfigure(2, weight=0)
+        self.criar_cabecalho()
+        self.criar_conteudo()
+        self.criar_rodape()
+
+    def criar_cabecalho(self) -> None:
+        cabecalho = ctk.CTkFrame(self.quadro, fg_color=self.AZUL, corner_radius=0, height=82)
+        cabecalho.grid(row=0, column=0, sticky="ew")
+        cabecalho.grid_propagate(False)
+        cabecalho.grid_columnconfigure(1, weight=1)
+        if self.logo_imagem:
+            ctk.CTkLabel(cabecalho, text="", image=self.logo_imagem).grid(row=0, column=0, padx=(22, 13), pady=10)
+        else:
+            ctk.CTkLabel(cabecalho, text="ÍCONA", text_color="white", font=ctk.CTkFont(size=19, weight="bold")).grid(row=0, column=0, padx=(22, 13), pady=14)
+        textos = ctk.CTkFrame(cabecalho, fg_color="transparent")
+        textos.grid(row=0, column=1, sticky="w", pady=12)
+        ctk.CTkLabel(textos, text="Conferência de Guias - Retidos", text_color="white", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(textos, text="Conferência automática de PDFs e planilha", text_color="#DCEBFA", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(2, 0))
+
+    def criar_conteudo(self) -> None:
+        area = ctk.CTkFrame(self.quadro, fg_color="transparent")
+        area.grid(row=1, column=0, sticky="nsew", padx=22, pady=(18, 8))
+        area.grid_columnconfigure(0, weight=1)
+        area.grid_rowconfigure(0, weight=0)
+        area.grid_rowconfigure(1, weight=1)
+        area.grid_rowconfigure(2, weight=0)
+        area.grid_rowconfigure(3, weight=0)
+        area.grid_rowconfigure(4, weight=0)
+        area.grid_rowconfigure(5, weight=0)
+        self.card = ctk.CTkFrame(area, corner_radius=12, fg_color=("#FFFFFF", self.CARD_ESCURO), border_width=1, border_color=("#DCE3EC", "#334155"))
+        self.card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        self.card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self.card, text="Arquivos para conferência", text_color=("#1F2937", "#F8FAFC"), font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 3))
+        ctk.CTkLabel(self.card, text="Informe a pasta raiz (com IRRF, CSRF, INSS) e a planilha Apuracao-retidos.", text_color=("#6B7280", "#CBD5E1"), font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 14))
+        self.criar_linha_pasta(2, "Pasta raiz das guias", self.pasta_raiz, self.selecionar_pasta_raiz, "botao_selecionar_pasta")
+        self.criar_linha_arquivo_excel()
+        self.botao_processar = ctk.CTkButton(self.card, text="Conferir guias", command=self.iniciar_processamento, height=38, corner_radius=8, fg_color=self.AZUL, hover_color=self.AZUL_HOVER, font=ctk.CTkFont(size=13, weight="bold"))
+        self.botao_processar.grid(row=8, column=0, sticky="w", padx=18, pady=(12, 17))
+        self.status = ctk.StringVar(value="Selecione as pastas para iniciar.")
+        ctk.CTkLabel(area, textvariable=self.status, text_color=("#6B7280", "#CBD5E1"), font=ctk.CTkFont(size=12)).grid(row=2, column=0, sticky="w", pady=(10, 3))
+        self.progresso = ctk.CTkProgressBar(area, height=11, corner_radius=6, progress_color=self.VERDE, fg_color=("#DCE3EC", "#334155"))
+        self.progresso.grid(row=3, column=0, sticky="ew")
+        self.progresso.set(0)
+        self.percentual = ctk.StringVar(value="0%")
+        ctk.CTkLabel(area, textvariable=self.percentual, text_color=("#6B7280", "#CBD5E1"), font=ctk.CTkFont(size=11)).grid(row=4, column=0, sticky="e", pady=(2, 0))
+        self.resultado = ctk.StringVar(value="")
+        self.label_resultado = ctk.CTkLabel(area, textvariable=self.resultado, justify="left", anchor="w", wraplength=600, text_color=(self.VERDE, "#4ADE80"), font=ctk.CTkFont(size=12))
+        self.label_resultado.grid(row=5, column=0, sticky="w", pady=(6, 3))
+        self.botao_abrir = ctk.CTkButton(area, text="Abrir planilha", command=self.abrir_planilha, state="disabled", width=126, height=32, corner_radius=8, fg_color=("#E7EDF4", "#334155"), hover_color=("#D8E1EB", "#475569"), text_color=("#1F2937", "#F8FAFC"))
+        self.botao_abrir.grid(row=6, column=0, sticky="w", pady=(2, 0))
+
+    def criar_linha_pasta(self, linha: int, rotulo: str, variavel: ctk.StringVar, comando: Callable[[], None], atributo_botao: str) -> None:
+        ctk.CTkLabel(self.card, text=rotulo, text_color=("#1F2937", "#F8FAFC"), font=ctk.CTkFont(size=12, weight="bold")).grid(row=linha, column=0, sticky="w", padx=18, pady=(0 if linha == 2 else 10, 4))
+        linha_frame = ctk.CTkFrame(self.card, fg_color="transparent")
+        linha_frame.grid(row=linha + 1, column=0, sticky="ew", padx=18)
+        linha_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(linha_frame, textvariable=variavel, height=34, corner_radius=7, border_color=("#C9D3DF", "#334155"), fg_color=("#FFFFFF", "#111827"), text_color=("#1F2937", "#F8FAFC")).grid(row=0, column=0, sticky="ew")
+        botao = ctk.CTkButton(linha_frame, text="Selecionar", command=comando, width=104, height=34, corner_radius=7, fg_color=("#E7EDF4", "#334155"), hover_color=("#D8E1EB", "#475569"), text_color=("#1F2937", "#F8FAFC"))
+        botao.grid(row=0, column=1, padx=(9, 0))
+        setattr(self, atributo_botao, botao)
+
+    def criar_linha_arquivo_excel(self) -> None:
+        self.criar_linha_pasta(4, "Arquivo Apuração-retidos", self.caminho_excel, self.selecionar_arquivo_excel, "botao_selecionar_excel")
+
+    def criar_rodape(self) -> None:
+        rodape = ctk.CTkFrame(self.quadro, fg_color="transparent")
+        rodape.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 13))
+        rodape.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(rodape, text="ÍCONA Contabilidade • Uso licenciado • Distribuição proibida", text_color=("#6B7280", "#CBD5E1"), font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.botao_tema = ctk.CTkButton(rodape, text="☀ Claro", command=self.alternar_tema, width=98, height=28, corner_radius=14, fg_color=("#E7EDF4", "#334155"), hover_color=("#D8E1EB", "#475569"), text_color=("#1F2937", "#F8FAFC"), font=ctk.CTkFont(size=11, weight="bold"))
+        self.botao_tema.grid(row=0, column=1, sticky="e")
+
+    def alternar_tema(self) -> None:
+        self.modo_escuro = not self.modo_escuro
+        ctk.set_appearance_mode("Dark" if self.modo_escuro else "Light")
+        self.botao_tema.configure(text="☀ Claro" if self.modo_escuro else "☾ Escuro")
+
+    def selecionar_pasta_raiz(self) -> None:
+        pasta = filedialog.askdirectory(title="Selecione a pasta raiz das guias", initialdir=self.pasta_raiz.get() or str(Path.home()))
+        if pasta:
+            self.pasta_raiz.set(pasta)
+            self.resultado.set("")
+            self.botao_abrir.configure(state="disabled")
+
+    def selecionar_arquivo_excel(self) -> None:
+        arquivo = filedialog.askopenfilename(
+            title="Selecione o arquivo Apuração-retidos.xlsx",
+            initialdir=str(Path(self.caminho_excel.get()).parent) if self.caminho_excel.get() else str(Path.home()),
+            filetypes=[("Arquivos Excel", "*.xlsx *.xls"), ("Todos os arquivos", "*.*")],
+        )
+        if arquivo:
+            self.caminho_excel.set(arquivo)
+            self.resultado.set("")
+            self.botao_abrir.configure(state="disabled")
+
+    def iniciar_processamento(self) -> None:
+        pasta_raiz = Path(self.pasta_raiz.get().strip())
+        caminho_excel = Path(self.caminho_excel.get().strip().strip('"'))
+        if not pasta_raiz.is_dir():
+            messagebox.showerror("Pasta inválida", "Selecione uma pasta raiz válida.")
+            return
+        if not caminho_excel.is_file():
+            messagebox.showerror("Arquivo inválido", "Selecione um arquivo Excel válido.")
+            return
+        for botao in [self.botao_processar, self.botao_selecionar_pasta, self.botao_selecionar_excel, self.botao_abrir]:
+            botao.configure(state="disabled")
+        self.resultado.set("")
+        self.label_resultado.configure(text_color=(self.VERDE, "#4ADE80"))
+        self.progresso.set(0)
+        self.percentual.set("0%")
+        self.status.set("Preparando processamento...")
+        threading.Thread(target=self.processar_guias, args=(pasta_raiz, caminho_excel), daemon=True).start()
+
+    def atualizar_progresso(self, atual: int, total: int, nome_arquivo: str) -> None:
+        percentual = int((atual / total) * 100) if total else 0
+        self.progresso.set(atual / total if total else 0)
+        self.percentual.set(f"{percentual}%")
+        self.status.set(f"Processando {atual} de {total}: {nome_arquivo}")
+
+    def processar_guias(self, pasta_raiz: Path, caminho_excel: Path) -> None:
+        try:
+            def callback(atual: int, total: int, nome: str) -> None:
+                self.raiz.after(0, lambda: self.atualizar_progresso(atual, total, nome))
+            self.raiz.after(0, lambda: self.status.set("Lendo PDFs e planilha..."))
+            caminho_saida, total = executar_com_progresso(pasta_raiz, caminho_excel, callback)
+            self.arquivo_saida = caminho_saida
+            self.raiz.after(0, lambda: self.finalizar_sucesso(total))
+        except Exception as erro:
+            self.raiz.after(0, lambda: self.finalizar_erro(str(erro)))
+
+    def finalizar_sucesso(self, total: int) -> None:
+        self.progresso.set(1)
+        self.percentual.set("100%")
+        self.status.set("Processamento concluído.")
+        self.resultado.set(f"Concluído: {total} arquivo(s) processado(s).\nPlanilha criada: {self.arquivo_saida}")
+        for botao in [self.botao_processar, self.botao_selecionar_pasta, self.botao_selecionar_excel]:
+            botao.configure(state="normal")
+        self.botao_abrir.configure(state="normal")
+        messagebox.showinfo("Processamento concluído", f"{total} arquivo(s) processado(s).\n\nPlanilha criada com sucesso em:\n{self.arquivo_saida}")
+
+    def finalizar_erro(self, mensagem: str) -> None:
+        self.status.set("Processamento não concluído.")
+        self.resultado.set(f"Erro: {mensagem}")
+        self.label_resultado.configure(text_color=(self.VERMELHO, "#F87171"))
+        for botao in [self.botao_processar, self.botao_selecionar_pasta, self.botao_selecionar_excel]:
+            botao.configure(state="normal")
+        self.botao_abrir.configure(state="disabled")
+        messagebox.showerror("Erro no processamento", mensagem)
+
+    def abrir_planilha(self) -> None:
+        if self.arquivo_saida and self.arquivo_saida.exists():
+            if sys.platform == "win32":
+                os.startfile(self.arquivo_saida)
+            elif sys.platform == "darwin":
+                os.system(f'open "{self.arquivo_saida}"')
+            else:
+                os.system(f'xdg-open "{self.arquivo_saida}"')
+        else:
+            messagebox.showwarning("Planilha não encontrada", "A planilha de resultado não está disponível.")
+
+def main() -> None:
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("br.com.icona.conferencia.guias.retidos")
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    raiz = ctk.CTk()
+    ConferenciaApp(raiz)
+    raiz.mainloop()
+
+if __name__ == "__main__":
+    main()
