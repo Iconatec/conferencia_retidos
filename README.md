@@ -1,6 +1,6 @@
 # Conferência de Guias Retidos
 
-Aplicação para conferir guias de IRRF, CSRF e INSS em PDF contra a planilha `Apuracao-retidos.xlsx`.
+Aplicação com interface gráfica para conferir guias de IRRF, CSRF e INSS em PDF contra a planilha `Apuracao-retidos.xlsx`, utilizando também o CNPJ como critério de cruzamento.
 
 ## O que o programa faz
 
@@ -13,10 +13,11 @@ Aplicação para conferir guias de IRRF, CSRF e INSS em PDF contra a planilha `A
    - Código de receita
    - Período de apuração
    - Valor da guia
+   - CNPJ (quando identificado no PDF)
 3. Lê a aba `Base Guias` da planilha `Apuracao-retidos.xlsx`.
 4. Cruza os dados usando a chave:
 
-Agente + Imposto + Empresa + Período de Apuração + Valor
+**Agente + Imposto + Empresa + Período de Apuração + Valor + CNPJ**
 
 5. Compara o valor do PDF com o valor da planilha.
 6. Valida se o código identificado no PDF é permitido para o imposto.
@@ -25,22 +26,25 @@ Agente + Imposto + Empresa + Período de Apuração + Valor
 ## Regras de resultado
 
 | Situação | Status Final |
-- Guia localizada, valor igual e código válido | `ok` |
-- Guias múltiplas com soma igual e códigos válidos | `ok` — Informações corretas (múltiplas guias) |
-- Guia localizada e valor diferente | `revisar` — Valor da guia divergente |
-- Guia com código incompatível | `revisar` |
-- Linha da planilha sem PDF correspondente | `revisar` — Apenas planilha |
-- PDF sem linha correspondente na planilha | `revisar` — Apenas PDF |
-- PDF com dados insuficientes para cruzamento | `revisar` |
+| --- | --- |
+| Guia localizada, valor igual, código válido e CNPJ coincidente | `ok` |
+| Guias múltiplas com soma igual, códigos válidos e mesmo CNPJ | `ok` — Informações corretas (múltiplas guias) |
+| Guia localizada e valor diferente | `revisar` — Valor da guia divergente |
+| Guia com código incompatível | `revisar` |
+| Guia/PDF com CNPJ divergente da planilha | `revisar` |
+| Linha da planilha sem PDF correspondente | `revisar` — Apenas planilha |
+| PDF sem linha correspondente na planilha | `revisar` — Apenas PDF |
+| PDF com dados insuficientes para cruzamento | `revisar` |
 
-A conferência considera o valor correto somente quando a diferença é exatamente `0,00` e o código da guia é válido para o imposto identificado.
+A conferência considera o valor correto somente quando a diferença é exatamente `0,00`, o código da guia é válido para o imposto identificado e o CNPJ coincide entre planilha e PDF.
 
 ## Códigos de receita aceitos
 
 | Imposto | Códigos aceitos |
-- IRRF | `1708`, `3280` ou `8045` |
-- CSRF | `5952` |
-- INSS | `1162` |
+| --- | --- |
+| IRRF | `1708`, `3280` ou `8045` |
+| CSRF | `5952` |
+| INSS | `1162` |
 
 Para INSS, o programa procura as linhas da composição da guia, verifica os códigos encontrados e soma os valores das linhas identificadas. Caso não consiga localizar as linhas, tenta utilizar o valor total do documento.
 
@@ -57,7 +61,7 @@ Para INSS, o programa procura as linhas da composição da guia, verifica os có
 ## Estrutura das pastas
 
 A pasta raiz selecionada deve conter as subpastas abaixo:
-Pasta das guias/
+
 ```text
 Pasta das guias/
 ├── IRRF/
@@ -69,41 +73,51 @@ Pasta das guias/
 ```
 
 Os nomes dos PDFs devem seguir o padrão:
+
+```text
 agente - imposto - empresa - periodo.pdf
+```
 
 Exemplo:
+
+```text
 5 - IRRF - W&W PARTICIPAÇÕES S.A. - 07.2026.pdf
+```
 
 ## Planilha de entrada
 
 O arquivo Excel deve possuir uma aba chamada `Base Guias` e conter as seguintes colunas:
 
 | Coluna | Descrição |
-
-- `Agente` | Identificador utilizado na chave de cruzamento |
-- `CNPJ` | CNPJ da empresa, exibido no resultado |
-- `Valor Guia` | Valor esperado da guia |
-- `Imposto` | IRRF, CSRF, INSS ou uma variação reconhecida |
-- `Periodo` ou `Período` | Período de apuração da guia |
-- `Empresa` | Nome da empresa utilizado na chave de cruzamento |
+| --- | --- |
+| `Agente` | Identificador utilizado na chave de cruzamento |
+| `CNPJ` | CNPJ da empresa, utilizado no cruzamento e exibido no resultado |
+| `Valor Guia` | Valor esperado da guia |
+| `Imposto` | IRRF, CSRF, INSS ou uma variação reconhecida |
+| `Periodo` ou `Período` | Período de apuração da guia |
+| `Empresa` | Nome da empresa utilizado na chave de cruzamento |
 
 ## Arquivo de saída
 
 O resultado é salvo como:
+
+```text
 resultado_conferencia_retidos.xlsx
+```
+
 O arquivo é criado na mesma pasta da planilha Excel de entrada e contém as colunas:
 
-Agente
-CNPJ
-Valor Guia
-Imposto
-Periodo
-Empresa
-Valor PDF
-Diferenca
-Codigo PDF
-Status Final
-Situacao
+- `Agente`
+- `CNPJ`
+- `Valor Guia`
+- `Imposto`
+- `Periodo`
+- `Empresa`
+- `Valor PDF`
+- `Diferenca`
+- `Codigo PDF`
+- `Status Final`
+- `Situacao`
 
 Na coluna `Status Final`:
 - `ok` recebe preenchimento verde
@@ -114,7 +128,35 @@ Na coluna `Status Final`:
 1. Abra o executável.
 2. Selecione a pasta raiz dos PDFs.
 3. Confirme que a pasta contém as subpastas `IRRF`, `CSRF` e `INSS`.
-4. Selecione o arquivo Excel `Apuracao-retidos.xlsx`, ou informe a pasta onde ele está localizado quando utilizar a versão em Python.
+4. Selecione o arquivo Excel `Apuracao-retidos.xlsx`.
 5. Clique em **Conferir guias**.
-6. Ao final do processamento, abra o arquivo `resultado_conferencia_retidos.xlsx`.
+6. Ao final do processamento, clique em **Abrir planilha** ou abra manualmente o arquivo `resultado_conferencia_retidos.xlsx`.
 
+## Requisitos
+
+Para executar a versão em Python (sem o executável), são necessárias as seguintes bibliotecas:
+
+- `customtkinter`
+- `pandas`
+- `openpyxl`
+- `Pillow`
+- `pdfplumber` ou `PyMuPDF` (fitz)
+
+Instale as dependências com:
+
+```bash
+pip install customtkinter pandas openpyxl Pillow pdfplumber
+```
+
+ou, alternativamente:
+
+```bash
+pip install customtkinter pandas openpyxl Pillow pymupdf
+```
+
+## Observações sobre o CNPJ
+
+- O CNPJ é extraído do PDF sempre que identificado no formato `00.000.000/0000-00`.
+- O CNPJ da planilha e o CNPJ do PDF são comparados pelos dígitos (sem formatação).
+- Se o CNPJ não for identificado no PDF, o cruzamento ainda ocorre, mas a ausência do CNPJ pode gerar situação de revisão, dependendo dos demais campos.
+- Guias com mesmo agente, empresa, imposto, período e valor, mas CNPJs diferentes, são tratadas como guias distintas.
