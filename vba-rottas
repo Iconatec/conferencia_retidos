@@ -1,0 +1,139 @@
+Sub gerar_planilha()
+Dim ws3 As Worksheet
+Dim ws4 As Worksheet
+Dim ws5 As Worksheet
+Dim i As Long
+Dim ultimaBR As Long
+Dim ultimaBase As Long
+
+Set ws3 = ActiveWorkbook.Sheets("BR")
+
+periodo = InputBox("Informar no formato: Mês/Ano" & vbCrLf & "Exemplo: Janeiro/2026", "Qual o período de apuração?")
+
+If periodo = "" Then
+MsgBox "Processso cancelado"
+Exit Sub
+End If
+
+Application.ScreenUpdating = False
+
+'criar ou limpar aba Base Guias
+On Error Resume Next
+Set ws4 = Worksheets("Base prévia")
+On Error GoTo 0
+
+If ws4 Is Nothing Then
+    Set ws4 = Worksheets.Add
+    ws4.Name = "Base prévia"
+Else
+    ws4.Cells.Clear
+End If
+
+
+ultimaBR = ws3.Cells(ws3.Rows.Count, "B").End(xlUp).Row
+
+ultimaBase = ws4.Cells(ws3.Rows.Count, "B").End(xlUp).Row
+
+ws3.Columns("A").Copy Destination:=ws4.Columns("A")
+'Eliminar as duplicadas e fazer o somase
+ultimaLinha = ws4.Cells(ws4.Rows.Count, "A").End(xlUp).Row
+
+If ultimaLinha >= 1 Then
+    ws4.Range("A1:A" & ultimaLinha).RemoveDuplicates _
+        Columns:=1, Header:=xlNo
+End If
+ultimaLinha = ws4.Cells(ws4.Rows.Count, "A").End(xlUp).Row
+ws4.Range("A1:F1").Value = Array("Código", "CNPJ", "IR", "INSS", "PCC", "Período")
+
+'Trazer as informações
+ultimaBase = ws3.Cells(ws3.Rows.Count, "A").End(xlUp).Row
+For i = 2 To ultimaLinha
+    ws4.Cells(i, "B").Formula = "=XLOOKUP(A" & i & ",'BR'!A:A,'BR'!AD:AD,""VERIFICAR"")"
+    ws4.Cells(i, "C").Formula = "=SUMIFS(BR!K:K,BR!A:A,A" & i & ",BR!T:T,""<>Pendente"")"
+    ws4.Cells(i, "D").Formula = "=SUMIFS(BR!L:L,BR!A:A,A" & i & ",BR!T:T,""<>Pendente"")"
+    ws4.Cells(i, "E").Formula = "=SUMIFS(BR!N:N,BR!A:A,A" & i & ",BR!T:T,""<>Pendente"")"
+    ws4.Cells(i, "F").Value = periodo
+Next i
+
+'Formatação da aba base guias
+ws4.Range("C1:E1").NumberFormat = "#,##0.00"
+ws4.Columns("B").NumberFormat = "00\.000\.000\/0000\-00"
+
+'Levar as informações para a aba definitiva
+On Error Resume Next
+Set ws5 = Worksheets("Base Guias")
+On Error GoTo 0
+
+If ws5 Is Nothing Then
+    Set ws5 = Worksheets.Add
+    ws5.Name = "Base Guias"
+Else
+    ws5.Cells.Clear
+End If
+
+linhaP = 2
+ws5.Range("A1:F1").Value = Array("Agente", "CNPJ", "Valor Guia", "Imposto", "Período", "Empresa")
+For i = 2 To ultimaLinha
+
+'IRRF
+If ws4.Cells(i, "C").Value > 0 Then
+    ws5.Cells(linhaP, "A").Value = ws4.Cells(i, "A").Value
+    ws5.Cells(linhaP, "B").Value = ws4.Cells(i, "B").Value
+    ws5.Cells(linhaP, "C").Value = ws4.Cells(i, "C").Value
+    ws5.Cells(linhaP, "D").Value = "IRRF"
+    ws5.Cells(linhaP, "E").Value = periodo
+    ws5.Cells(linhaP, "F").Formula = "=XLOOKUP(A" & linhaP & ",'OBRA'!A:A,'OBRA'!H:H,"""")"
+    ws5.Cells(linhaP, "F").Value = ws5.Cells(linhaP, "F").Value
+    linhaP = linhaP + 1
+End If
+
+'INSS
+If ws4.Cells(i, "D").Value > 0 Then
+    ws5.Cells(linhaP, "A").Value = ws4.Cells(i, "A").Value
+    ws5.Cells(linhaP, "B").Value = ws4.Cells(i, "B").Value
+    ws5.Cells(linhaP, "C").Value = ws4.Cells(i, "D").Value
+    ws5.Cells(linhaP, "D").Value = "INSS"
+    ws5.Cells(linhaP, "E").Value = periodo
+    ws5.Cells(linhaP, "F").Formula = "=XLOOKUP(A" & linhaP & ",'OBRA'!A:A,'OBRA'!H:H,"""")"
+    ws5.Cells(linhaP, "F").Value = ws5.Cells(linhaP, "F").Value
+    linhaP = linhaP + 1
+End If
+
+'PCC
+If ws4.Cells(i, "E").Value > 0 Then
+    ws5.Cells(linhaP, "A").Value = ws4.Cells(i, "A").Value
+    ws5.Cells(linhaP, "B").Value = ws4.Cells(i, "B").Value
+    ws5.Cells(linhaP, "C").Value = ws4.Cells(i, "E").Value
+    ws5.Cells(linhaP, "D").Value = "CSRF"
+    ws5.Cells(linhaP, "E").Value = periodo
+    ws5.Cells(linhaP, "F").Formula = "=XLOOKUP(A" & linhaP & ",'OBRA'!A:A,'OBRA'!H:H,"""")"
+    ws5.Cells(linhaP, "F").Value = ws5.Cells(linhaP, "F").Value
+    linhaP = linhaP + 1
+End If
+
+
+
+Next i
+
+'Formatação
+ws5.Range("C:C").NumberFormat = "#,##0.00"
+ws5.Columns("B").NumberFormat = "00\.000\.000\/0000\-00"
+
+'Criar novo arquivo somente com a Base Guias
+Dim wbNovo As Workbook
+Dim caminhoArquivo As String
+
+ws5.Copy
+Set wbNovo = ActiveWorkbook
+
+caminhoArquivo = ThisWorkbook.Path & Application.PathSeparator & "Apuração-retidos.xlsx"
+
+Application.DisplayAlerts = False
+wbNovo.SaveAs Filename:=caminhoArquivo, FileFormat:=xlOpenXMLWorkbook
+Application.DisplayAlerts = True
+
+wbNovo.Close SaveChanges:=False
+
+Application.ScreenUpdating = True
+MsgBox "Processo finalizado" & vbCrLf & "Arquivo salvo em: " & caminhoArquivo
+End Sub
