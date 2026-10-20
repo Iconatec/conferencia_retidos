@@ -1,0 +1,101 @@
+Sub gerar_retidos()
+
+Dim ws As Worksheet
+Dim ws2 As Worksheet
+Dim ws3 As Worksheet
+
+Set ws = ActiveWorkbook.Sheets("Dinâmica CSRF")
+Set ws2 = ActiveWorkbook.Sheets("Dinâmica INSS, IRRF e ISS")
+
+periodo = InputBox("Informar no formato: Mês/Ano" & vbCrLf & "Exemplo: Janeiro/2026", "Qual o período de apuração?")
+
+'criar ou limpar aba Base Guias
+On Error Resume Next
+Set ws3 = Worksheets("Base Guias")
+On Error GoTo 0
+
+If ws3 Is Nothing Then
+    Set ws3 = Worksheets.Add
+    ws3.Name = "Base Guias"
+Else
+    ws3.Cells.Clear
+End If
+
+ws3.Range("A1:F1").Value = Array("Agente", "CNPJ", "Valor Guia", "Imposto", "Período", "Empresa")
+ultimaLinha = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row - 1
+linhaBase = 2
+
+'CSRF
+For i = 4 To ultimaLinha
+If Not IsNumeric(ws.Cells(i, "A").Value) And ws.Cells(i, "A") <> "CONTSOC" Then
+    ws3.Cells(linhaBase, "F").Value = ws.Cells(i, "A").Value
+    ws3.Cells(linhaBase, "A").Value = ws.Cells(i - 1, "A").Value
+    ws3.Cells(linhaBase, "B").Formula = "=XLOOKUP(F" & linhaBase & ",'Base CNPJs'!A:A,'Base CNPJs'!B:B,""VERIFICAR"")"
+    ws3.Cells(linhaBase, "B").Value = ws3.Cells(linhaBase, "B").Value
+    ws3.Cells(linhaBase, "C").Value = ws.Cells(i, "B").Value
+    ws3.Cells(linhaBase, "D").Value = "CSRF"
+    ws3.Cells(linhaBase, "E").Value = periodo
+    linhaBase = linhaBase + 1
+End If
+Next i
+
+'IRRF e INSS
+ultimaLinha2 = ws2.Cells(ws2.Rows.Count, "A").End(xlUp).Row - 1
+For i = 4 To ultimaLinha2
+If Not IsNumeric(ws2.Cells(i, "A").Value) Then
+    'IRRF
+    ws3.Cells(linhaBase, "F").Value = ws2.Cells(i, "A").Value
+    ws3.Cells(linhaBase, "A").Value = ws2.Cells(i - 1, "A").Value
+    ws3.Cells(linhaBase, "B").Formula = "=XLOOKUP(F" & linhaBase & ",'Base CNPJs'!A:A,'Base CNPJs'!B:B,""VERIFICAR"")"
+    ws3.Cells(linhaBase, "B").Value = ws3.Cells(linhaBase, "B").Value
+    ws3.Cells(linhaBase, "C").Value = ws2.Cells(i, "B").Value
+    ws3.Cells(linhaBase, "D").Value = "IRRF"
+    ws3.Cells(linhaBase, "E").Value = periodo
+    linhaBase = linhaBase + 1
+    'INSS
+    ws3.Cells(linhaBase, "F").Value = ws2.Cells(i, "A").Value
+    ws3.Cells(linhaBase, "A").Value = ws2.Cells(i - 1, "A").Value
+    ws3.Cells(linhaBase, "B").Formula = "=XLOOKUP(F" & linhaBase & ",'Base CNPJs'!A:A,'Base CNPJs'!B:B,""VERIFICAR"")"
+    ws3.Cells(linhaBase, "B").Value = ws3.Cells(linhaBase, "B").Value
+    ws3.Cells(linhaBase, "C").Value = ws2.Cells(i, "C").Value
+    ws3.Cells(linhaBase, "D").Value = "INSS"
+    ws3.Cells(linhaBase, "E").Value = periodo
+    linhaBase = linhaBase + 1
+End If
+Next i
+
+'Excluir os valores zerados
+For i = linhaBase To 2 Step -1
+If ws3.Cells(i, "C").Value = 0 Then ws3.Rows(i).Delete
+Next i
+
+'Formatação
+ws3.Range("C:C").NumberFormat = "#,##0.00"
+ws3.Columns("B").NumberFormat = "00\.000\.000\/0000\-00"
+ws3.Columns("A:F").AutoFit
+ws3.Range("A1:F1").Font.Bold = True
+ws3.Activate
+ws3.Rows("2:2").Select
+ActiveWindow.FreezePanes = True
+
+'Criar novo arquivo somente com a Base Guias
+Dim wbNovo As Workbook
+Dim caminhoArquivo As String
+
+ws3.Copy
+Set wbNovo = ActiveWorkbook
+
+caminhoArquivo = ThisWorkbook.Path & Application.PathSeparator & "Apuração-retidos.xlsx"
+
+Application.DisplayAlerts = False
+wbNovo.SaveAs Filename:=caminhoArquivo, FileFormat:=xlOpenXMLWorkbook
+Application.DisplayAlerts = True
+
+wbNovo.Close SaveChanges:=False
+
+Application.ScreenUpdating = True
+MsgBox "Processo finalizado" & vbCrLf & "Arquivo salvo em: " & caminhoArquivo
+
+
+End Sub
+
