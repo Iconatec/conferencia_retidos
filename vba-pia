@@ -1,0 +1,122 @@
+Sub gerar_planilha_retidos()
+
+Dim ws As Worksheet
+Dim ws2 As Worksheet
+Dim ws3 As Worksheet
+Dim ws4 As Worksheet
+Dim ultimaLinha As Long
+Dim i As Long
+
+Set ws = ActiveWorkbook.Sheets("IR PCC")
+Set ws2 = ActiveWorkbook.Sheets("INSS")
+Set ws4 = ActiveWorkbook.Sheets("BR")
+
+periodo = InputBox("Informar no formato: Mês/Ano" & vbCrLf & "Exemplo: Janeiro/2026", "Qual o período de apuração?")
+
+Application.ScreenUpdating = False
+'criar ou limpar aba Base Guias
+On Error Resume Next
+Set ws3 = Worksheets("Base Guias")
+On Error GoTo 0
+
+If ws3 Is Nothing Then
+    Set ws3 = Worksheets.Add
+    ws3.Name = "Base Guias"
+Else
+    ws3.Cells.Clear
+End If
+
+'Fazer a lista dos empreedimentos da IR PCC
+ws4.Columns("P").Copy Destination:=ws3.Columns("F")
+ws3.Rows(1).Insert
+ws3.Range("A1:F1").Value = Array("Agente", "CNPJ", "Valor Guia", "Imposto", "Período", "Empresa")
+ws3.Columns("F").RemoveDuplicates Columns:=1, Header:=xlYes
+ws3.Rows(2).Delete
+
+ultimaLinha = ws3.Cells(ws3.Rows.Count, "F").End(xlUp).Row
+
+'Triplicar as linhas e fazer o somase
+i = 2
+
+Do While i <= ultimaLinha
+    ws3.Rows(i + 1 & ":" & i + 2).Insert
+
+    '1ª Linha - IRRF
+    ws3.Cells(i, "E").Value = periodo
+    ws3.Cells(i, "D").Value = "IRRF"
+    ws3.Cells(i, "C").Formula = "=SUMIF('IR PCC'!N:N,F" & i & ",'IR PCC'!J:J)"
+    ws3.Cells(i, "C").Value = ws3.Cells(i, "C").Value
+    ws3.Cells(i, "B").Formula = "=XLOOKUP(F" & i & ",'BR'!P:P,'BR'!AD:AD,"""")"
+    ws3.Cells(i, "B").Value = ws3.Cells(i, "B").Value
+    ws3.Cells(i, "A").Formula = "=XLOOKUP(F" & i & ",'BR'!P:P,'BR'!A:A,"""")"
+    ws3.Cells(i, "A").Value = ws3.Cells(i, "A").Value
+
+    '2ª Linha - CSRF
+    ws3.Cells(i + 1, "F").Value = ws3.Cells(i, "F").Value
+    ws3.Cells(i + 1, "E").Value = periodo
+    ws3.Cells(i + 1, "D").Value = "CSRF"
+    ws3.Cells(i + 1, "C").Formula = "=SUMIF('IR PCC'!N:N,F" & i + 1 & ",'IR PCC'!M:M)"
+    ws3.Cells(i + 1, "C").Value = ws3.Cells(i + 1, "C").Value
+    ws3.Cells(i + 1, "B").Formula = "=XLOOKUP(F" & i + 1 & ",'BR'!P:P,'BR'!AD:AD,"""")"
+    ws3.Cells(i + 1, "B").Value = ws3.Cells(i + 1, "B").Value
+    ws3.Cells(i + 1, "A").Formula = "=XLOOKUP(F" & i + 1 & ",'BR'!P:P,'BR'!A:A,"""")"
+    ws3.Cells(i + 1, "A").Value = ws3.Cells(i + 1, "A").Value
+
+    '3ª Linha - INSS
+    ws3.Cells(i + 2, "F").Value = ws3.Cells(i, "F").Value
+    ws3.Cells(i + 2, "E").Value = periodo
+    ws3.Cells(i + 2, "D").Value = "INSS"
+    ws3.Cells(i + 2, "C").Formula = "=SUMIF('INSS'!N:N,F" & i + 2 & ",'INSS'!K:K)"
+    ws3.Cells(i + 2, "C").Value = ws3.Cells(i + 2, "C").Value
+    ws3.Cells(i + 2, "B").Formula = "=XLOOKUP(F" & i + 2 & ",'BR'!P:P,'BR'!AD:AD,"""")"
+    ws3.Cells(i + 2, "B").Value = ws3.Cells(i + 2, "B").Value
+    ws3.Cells(i + 2, "A").Formula = "=XLOOKUP(F" & i + 2 & ",'BR'!P:P,'BR'!A:A,"""")"
+    ws3.Cells(i + 2, "A").Value = ws3.Cells(i + 2, "A").Value
+
+    'Ir para o próximo empreendimento
+    i = i + 3
+    ultimaLinha = ultimaLinha + 2
+Loop
+
+'Deletar as linhas com zero
+For i = ultimaLinha To 2 Step -1
+    If ws3.Cells(i, "C") = 0 Then ws3.Rows(i).Delete
+Next i
+
+'Formatação
+ws3.Range("C:C").NumberFormat = "#,##0.00"
+ws3.Columns("B").NumberFormat = "00\.000\.000\/0000\-00"
+ws3.Activate
+ws3.Rows("2:2").Select
+ActiveWindow.FreezePanes = True
+ws3.Range("A1:F1").Font.Bold = True
+ws3.Columns("A:F").AutoFit
+
+With ws3.Cells
+    .Font.Name = "Aptos Narrow"
+    .Font.Size = 11
+    .Interior.Pattern = xlNone
+End With
+Application.ScreenUpdating = True
+
+'Criar novo arquivo somente com a Base Guias
+Dim wbNovo As Workbook
+Dim caminhoArquivo As String
+
+ws3.Copy
+Set wbNovo = ActiveWorkbook
+
+caminhoArquivo = ThisWorkbook.Path & Application.PathSeparator & "Apuração-retidos.xlsx"
+
+Application.DisplayAlerts = False
+wbNovo.SaveAs Filename:=caminhoArquivo, FileFormat:=xlOpenXMLWorkbook
+Application.DisplayAlerts = True
+
+wbNovo.Close SaveChanges:=False
+
+Application.ScreenUpdating = True
+MsgBox "Processo finalizado" & vbCrLf & "Arquivo salvo em: " & caminhoArquivo
+
+
+
+End Sub
